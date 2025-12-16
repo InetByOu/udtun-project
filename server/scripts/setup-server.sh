@@ -91,6 +91,7 @@ copy_files() {
     # Make Python files executable
     chmod +x /opt/udtun/server/main.py
     chmod +x /opt/udtun/server/*.py
+    chmod +x /opt/udtun/server/src/*.py
     
     print_success "Files copied"
 }
