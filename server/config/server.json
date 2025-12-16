@@ -1,0 +1,19 @@
+{
+    "udp_port_range": [6000, 19999],
+    "listen_port": 5667,
+    "bind_ip": "0.0.0.0",
+    "tun_name": "udtun0",
+    "tun_ip": "10.9.0.1",
+    "tun_netmask": "255.255.255.0",
+    "tun_mtu": 1300,
+    "session_timeout": 30,
+    "keepalive_interval": 10,
+    "max_clients": 1000,
+    "udp_buffer_size": 4194304,
+    "max_packet_size": 1500,
+    "read_timeout": 0.01,
+    "enable_rate_limit": true,
+    "rate_limit_per_client": 1000,
+    "log_file": "/var/log/udtun/server.log",
+    "log_level": "INFO"
+}
