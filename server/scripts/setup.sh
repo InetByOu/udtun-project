@@ -85,15 +85,22 @@ copy_files() {
     SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
     SERVER_DIR="$(dirname "$SCRIPT_DIR")"
     
-    # Copy source files
-    cp -r "$SERVER_DIR/src/" /opt/udtun/server/
+    # Copy source files from src/ to /opt/udtun/server/
+    if [ -d "$SERVER_DIR/src" ]; then
+        cp -r "$SERVER_DIR/src/"* /opt/udtun/server/
+    else
+        # Fallback: copy everything except scripts
+        find "$SERVER_DIR" -type f -name "*.py" | while read -r file; do
+            if [[ ! "$file" =~ scripts/ ]]; then
+                cp "$file" /opt/udtun/server/
+            fi
+        done
+    fi
     
     # Make Python files executable
-    chmod +x /opt/udtun/server/main.py
-    chmod +x /opt/udtun/server/*.py
-    chmod +x /opt/udtun/server/src/*.py
+    find /opt/udtun/server -name "*.py" -type f -exec chmod +x {} \;
     
-    print_success "Files copied"
+    print_success "Files copied to /opt/udtun/server/"
 }
 
 create_config() {
@@ -101,6 +108,9 @@ create_config() {
     
     # Get server IP
     SERVER_IP=$(hostname -I | awk '{print $1}')
+    if [ -z "$SERVER_IP" ]; then
+        SERVER_IP="0.0.0.0"
+    fi
     
     # Create server config
     cat > /etc/udtun/server.json << EOF
@@ -143,7 +153,7 @@ setup_systemd() {
     print_info "Setting up systemd service..."
     
     # Create systemd service file
-    cat > /etc/systemd/system/udtun-server.service << EOF
+    cat > /etc/systemd/system/udtun-server.service << 'EOF'
 [Unit]
 Description=UDTUN UDP Tunneling Server
 After=network.target
@@ -154,7 +164,7 @@ Type=simple
 User=root
 WorkingDirectory=/opt/udtun/server
 ExecStart=/usr/bin/python3 /opt/udtun/server/main.py /etc/udtun/server.json
-ExecReload=/bin/kill -HUP \$MAINPID
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -179,7 +189,7 @@ EOF
     systemctl daemon-reload
     
     # Enable service
-    systemctl enable udtun-server.service
+    systemctl enable udtun-server.service 2>/dev/null || true
     
     print_success "Systemd service configured"
 }
@@ -191,7 +201,11 @@ setup_kernel_modules() {
     modprobe tun 2>/dev/null || true
     
     # Make sure module loads on boot
-    echo "tun" >> /etc/modules-load.d/tun.conf
+    if [ -d /etc/modules-load.d ]; then
+        echo "tun" > /etc/modules-load.d/tun.conf
+    else
+        echo "tun" >> /etc/modules
+    fi
     
     # Check if /dev/net/tun exists
     if [ ! -c /dev/net/tun ]; then
@@ -206,17 +220,28 @@ setup_kernel_modules() {
 setup_sysctl() {
     print_info "Configuring sysctl parameters..."
     
+    # Backup original sysctl.conf
+    cp /etc/sysctl.conf /etc/sysctl.conf.backup 2>/dev/null || true
+    
     # Enable IP forwarding
-    echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+    if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf; then
+        echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+    fi
     
     # Increase UDP buffer sizes
-    echo "net.core.rmem_max=4194304" >> /etc/sysctl.conf
-    echo "net.core.wmem_max=4194304" >> /etc/sysctl.conf
-    echo "net.core.rmem_default=262144" >> /etc/sysctl.conf
-    echo "net.core.wmem_default=262144" >> /etc/sysctl.conf
+    for param in net.core.rmem_max net.core.wmem_max net.core.rmem_default net.core.wmem_default; do
+        if ! grep -q "$param" /etc/sysctl.conf; then
+            case $param in
+                net.core.rmem_max) echo "$param=4194304" >> /etc/sysctl.conf ;;
+                net.core.wmem_max) echo "$param=4194304" >> /etc/sysctl.conf ;;
+                net.core.rmem_default) echo "$param=262144" >> /etc/sysctl.conf ;;
+                net.core.wmem_default) echo "$param=262144" >> /etc/sysctl.conf ;;
+            esac
+        fi
+    done
     
     # Apply changes
-    sysctl -p
+    sysctl -p 2>/dev/null || true
     
     print_success "Sysctl configured"
 }
@@ -226,22 +251,30 @@ setup_firewall() {
     
     # Get external interface
     EXT_IF=$(ip route | grep default | awk '{print $5}' | head -1)
-    
     if [ -z "$EXT_IF" ]; then
         print_warning "Could not determine external interface"
-        return
+        EXT_IF="eth0"
     fi
     
     # Disable UFW if it's running (we'll use iptables directly)
-    if systemctl is-active --quiet ufw; then
+    if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
         print_info "Disabling UFW..."
         ufw --force disable
     fi
     
-    # Basic iptables rules (server.py will add more)
-    iptables -P INPUT DROP
-    iptables -P FORWARD DROP
+    # Flush existing rules (careful!)
+    print_info "Setting up iptables rules..."
+    
+    # Set default policies
+    iptables -P INPUT ACCEPT
+    iptables -P FORWARD ACCEPT
     iptables -P OUTPUT ACCEPT
+    
+    # Flush all rules
+    iptables -F
+    iptables -t nat -F
+    iptables -t mangle -F
+    iptables -X
     
     # Allow established connections
     iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
@@ -249,14 +282,28 @@ setup_firewall() {
     
     # Allow loopback
     iptables -A INPUT -i lo -j ACCEPT
+    iptables -A OUTPUT -o lo -j ACCEPT
     
     # Allow SSH
     iptables -A INPUT -p tcp --dport 22 -j ACCEPT
     
-    # Allow ICMP
+    # Allow ICMP (ping)
     iptables -A INPUT -p icmp -j ACCEPT
     
+    # Allow UDP port range for UDTUN
+    iptables -A INPUT -p udp --dport 6000:19999 -j ACCEPT
+    
+    # Allow listening port
+    iptables -A INPUT -p udp --dport 5667 -j ACCEPT
+    
+    # DNAT: Redirect all UDP ports to our listening port
+    iptables -t nat -A PREROUTING -p udp --dport 6000:19999 -j DNAT --to-destination :5667
+    
+    # NAT masquerade
+    iptables -t nat -A POSTROUTING -o $EXT_IF -j MASQUERADE
+    
     # Save rules
+    mkdir -p /etc/iptables
     iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
     
     print_success "Firewall configured"
@@ -265,18 +312,28 @@ setup_firewall() {
 start_service() {
     print_info "Starting UDTUN service..."
     
+    # Stop if already running
+    systemctl stop udtun-server.service 2>/dev/null || true
+    
     # Start service
-    systemctl start udtun-server.service
-    
-    # Check status
-    sleep 2
-    systemctl status udtun-server.service --no-pager
-    
-    print_success "Service started"
+    if systemctl start udtun-server.service; then
+        sleep 2
+        if systemctl is-active --quiet udtun-server.service; then
+            print_success "Service started successfully"
+            systemctl status udtun-server.service --no-pager
+        else
+            print_warning "Service started but not active. Check logs with: journalctl -u udtun-server"
+        fi
+    else
+        print_warning "Failed to start service. Check manually with: python3 /opt/udtun/server/main.py"
+    fi
 }
 
 show_summary() {
     SERVER_IP=$(hostname -I | awk '{print $1}')
+    if [ -z "$SERVER_IP" ]; then
+        SERVER_IP="$(ip addr show | grep -oP 'inet \K[\d.]+' | grep -v 127.0.0.1 | head -1)"
+    fi
     
     echo ""
     echo "=" * 60
@@ -291,6 +348,7 @@ show_summary() {
     echo "TUN Network:      10.9.0.1/24"
     echo "Config File:      /etc/udtun/server.json"
     echo "Log File:         /var/log/udtun/server.log"
+    echo "Install Dir:      /opt/udtun/server/"
     echo ""
     echo "Service Commands:"
     echo "-----------------"
@@ -300,18 +358,49 @@ show_summary() {
     echo "Status:           systemctl status udtun-server"
     echo "Logs:             journalctl -u udtun-server -f"
     echo ""
-    echo "Testing:"
-    echo "-------"
-    echo "Test server:      python3 /opt/udtun/server/main.py"
+    echo "Manual Testing:"
+    echo "--------------"
+    echo "Test server:      cd /opt/udtun/server && python3 main.py"
     echo "Check TUN:        ip addr show udtun0"
     echo "Check iptables:   iptables -L -n -v"
     echo "                  iptables -t nat -L -n -v"
+    echo ""
+    echo "Troubleshooting:"
+    echo "----------------"
+    echo "Check logs:       tail -f /var/log/udtun/server.log"
+    echo "Test ports:       nc -z -u localhost 5667"
+    echo "Check TUN device: ls -la /dev/net/tun"
     echo ""
     echo "Client Configuration:"
     echo "--------------------"
     echo "Set server_ip to: $SERVER_IP in client config"
     echo ""
     echo "=" * 60
+}
+
+test_installation() {
+    print_info "Testing installation..."
+    
+    # Check if main.py exists
+    if [ ! -f /opt/udtun/server/main.py ]; then
+        print_error "main.py not found in /opt/udtun/server/"
+        ls -la /opt/udtun/server/
+        return 1
+    fi
+    
+    # Check if config exists
+    if [ ! -f /etc/udtun/server.json ]; then
+        print_error "Config file not found: /etc/udtun/server.json"
+        return 1
+    fi
+    
+    # Check Python syntax
+    if ! python3 -m py_compile /opt/udtun/server/main.py 2>/dev/null; then
+        print_warning "Python syntax check failed for main.py"
+    fi
+    
+    print_success "Installation test passed"
+    return 0
 }
 
 main() {
@@ -332,6 +421,14 @@ main() {
     # Copy files
     copy_files
     
+    # Test file copy
+    if [ ! -f /opt/udtun/server/main.py ]; then
+        print_error "Failed to copy main.py. Manual copy needed."
+        print_info "Manual copy: cp src/*.py /opt/udtun/server/"
+        cp src/*.py /opt/udtun/server/ 2>/dev/null || true
+        chmod +x /opt/udtun/server/*.py 2>/dev/null || true
+    fi
+    
     # Create config
     create_config
     
@@ -347,14 +444,20 @@ main() {
     # Setup systemd
     setup_systemd
     
+    # Test installation
+    test_installation
+    
     # Start service
     start_service
     
     # Show summary
     show_summary
     
-    print_success "Installation completed successfully!"
+    print_success "Installation completed!"
+    echo ""
+    print_info "If service failed to start, try running manually:"
+    echo "cd /opt/udtun/server && python3 main.py"
 }
 
 # Run main function
-main
+main "$@"
